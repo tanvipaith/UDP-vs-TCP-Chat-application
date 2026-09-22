@@ -27,7 +27,7 @@ sudo apt-get install python3-tk
    ```bash
    python3 server.py
    ```
-   Leave the host as `0.0.0.0`, ports as `5000` (TCP) / `5001` (UDP), and click **Start Server**.
+   Leave the host as `0.0.0.0`, ports as `5050` (TCP) / `5001` (UDP), and click **Start Server**.
 
 2. **Start the client:**
    ```bash
@@ -47,6 +47,6 @@ sudo apt-get install python3-tk
      same server at once.
 
 ## Ports
-- TCP default: `5000`
+- TCP default: `5050`
 - UDP default: `5001`
 (The client auto-fills whichever default matches the protocol you select, but you can change them.)
