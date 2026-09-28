@@ -1,13 +1,29 @@
 """
-client.py
----------
-TCP + UDP Chat Client.
+client.py  --  FIELD UNIT
+-------------------------
+A rescue team's app for sending field reports to the Command Center.
 
-TCP  -> Port 5050
-UDP  -> Port 5001
+One window, two transports. Choose TCP or UDP with the protocol switch;
+only one socket is active at a time, and switching protocols creates a
+fresh socket of the new type.
 
-The user can switch between TCP and UDP to demonstrate
-the difference between reliable and unreliable communication.
+    TCP mode:
+        - socket.socket(AF_INET, SOCK_STREAM)
+        - connect() once -> a persistent, ordered, reliable byte stream
+        - every send() is guaranteed to arrive, in order, or the
+          connection reports an error.
+
+    UDP mode:
+        - socket.socket(AF_INET, SOCK_DGRAM)
+        - no connect() handshake -- each packet is fired independently
+          with sendto(); nothing guarantees delivery or order.
+        - a PACKET-LOSS SIMULATOR rolls a random number before sendto().
+          If "unlucky", the packet is never sent and is shown as
+          "not delivered". This stands in for the loss a real, flaky
+          disaster-zone network would cause, so the TCP-vs-UDP
+          difference can be demonstrated reliably on localhost.
+
+Run server.py first, then run one or more copies of this client.
 """
 
 import socket
@@ -17,1113 +33,439 @@ import random
 import datetime
 
 import customtkinter as ctk
+
+import messages
 import theme
 
-
-# ---------------------------------------------------------
-# APPLICATION SETTINGS
-# ---------------------------------------------------------
-
-ctk.set_appearance_mode("dark")
+ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 BUFFER_SIZE = 4096
-
-TCP_PORT = 5050
-UDP_PORT = 5001
+F = theme.FONT_FAMILY
 
 
-def now():
-    """Return the current time for chat messages."""
+def now() -> str:
     return datetime.datetime.now().strftime("%H:%M:%S")
 
 
-# =========================================================
-# CHAT CLIENT
-# =========================================================
-
-class ChatClient(ctk.CTk):
-
+class FieldUnit(ctk.CTk):
     def __init__(self):
         super().__init__()
-
-        # -------------------------------------------------
-        # Window settings
-        # -------------------------------------------------
-
-        self.title("TCP / UDP Chat Client")
-        self.geometry("520x720")
-        self.minsize(420, 560)
+        self.title("Field Unit — Disaster Response Communication")
+        self.geometry("560x760")
+        self.minsize(480, 640)
         self.configure(fg_color=theme.BG_MAIN)
 
-        # -------------------------------------------------
-        # Networking variables
-        # -------------------------------------------------
-
-        self.tcp_socket = None
-        self.udp_socket = None
-
-        self.udp_target = None
-
+        # ---- networking state ----
+        self.tcp_socket: socket.socket | None = None
+        self.udp_socket: socket.socket | None = None
+        self.udp_target: tuple[str, int] | None = None
         self.connected = False
+        self.listen_thread: threading.Thread | None = None
 
-        self.listen_thread = None
-
-        # -------------------------------------------------
-        # Statistics
-        # -------------------------------------------------
-
+        # ---- stats ----
         self.sent_count = 0
         self.received_count = 0
         self.dropped_count = 0
 
-        # -------------------------------------------------
-        # Queue
-        # -------------------------------------------------
-        # Networking runs in background threads.
-        # Tkinter GUI updates must happen on the main thread.
-        # The queue safely transfers received messages.
-
-        self.event_queue = queue.Queue()
-
-        # Build interface
+        # Cross-thread messaging (see server.py for why this exists)
+        self.event_queue: "queue.Queue[tuple]" = queue.Queue()
 
         self._build_ui()
-
-        # Check queue every 100 milliseconds
-
+        self._apply_protocol_style("TCP")
         self.after(100, self._drain_queue)
-
-        # Handle closing the window
-
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # =====================================================
-    # USER INTERFACE
-    # =====================================================
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _entry(self, parent, width, default=""):
+        e = ctk.CTkEntry(parent, width=width, fg_color=theme.BG_MAIN, border_color=theme.BORDER,
+                         border_width=1, text_color=theme.TEXT_PRIMARY)
+        if default:
+            e.insert(0, default)
+        return e
+
+    def _small_label(self, parent, text):
+        return ctk.CTkLabel(parent, text=text, font=(F, 11), text_color=theme.TEXT_MUTED)
+
+    def _segmented(self, parent, values, command):
+        return ctk.CTkSegmentedButton(
+            parent, values=values, command=command, fg_color=theme.BORDER,
+            unselected_color=theme.BORDER, unselected_hover_color="#cbd5e1",
+            text_color=theme.TEXT_PRIMARY, font=(F, 12, "bold"),
+        )
 
     def _build_ui(self):
+        # ---- header: title + protocol badge ----
+        header = ctk.CTkFrame(self, fg_color=theme.BG_MAIN, corner_radius=0)
+        header.pack(fill="x")
+        title = ctk.CTkFrame(header, fg_color="transparent")
+        title.pack(side="left", padx=24, pady=16)
+        ctk.CTkLabel(title, text="FIELD UNIT", font=(F, 11, "bold"),
+                     text_color=theme.TEXT_MUTED).pack(anchor="w")
+        ctk.CTkLabel(title, text="Disaster Response", font=(F, 20, "bold"),
+                     text_color=theme.TEXT_PRIMARY).pack(anchor="w")
 
-        # -------------------------------------------------
-        # Connection panel
-        # -------------------------------------------------
-
-        panel = ctk.CTkFrame(
-            self,
-            fg_color=theme.BG_PANEL,
-            corner_radius=0
-        )
-
-        panel.pack(
-            side="top",
-            fill="x"
-        )
-
-        inner = ctk.CTkFrame(
-            panel,
-            fg_color="transparent"
-        )
-
-        inner.pack(
-            fill="x",
-            padx=16,
-            pady=14
-        )
-
-        # -------------------------------------------------
-        # Protocol selector
-        # -------------------------------------------------
-
-        ctk.CTkLabel(
-            inner,
-            text="Protocol",
-            text_color=theme.TEXT_MUTED
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w"
-        )
-
-        self.protocol_switch = ctk.CTkSegmentedButton(
-            inner,
-            values=["TCP", "UDP"],
-            command=self._on_protocol_change,
-            selected_color=theme.TCP_COLOR,
-            selected_hover_color=theme.TCP_COLOR
-        )
-
-        self.protocol_switch.set("TCP")
-
-        self.protocol_switch.grid(
-            row=1,
-            column=0,
-            sticky="w",
-            pady=(4, 12)
-        )
-
-        # -------------------------------------------------
-        # Protocol badge
-        # -------------------------------------------------
-
+        # Big, always-visible indicator of the protocol currently in use
         self.protocol_badge = ctk.CTkLabel(
-            inner,
-            text="TCP  (reliable)",
-            fg_color=theme.TCP_COLOR,
-            text_color="white",
-            corner_radius=8,
-            width=140,
-            height=28,
-            font=(theme.FONT_FAMILY, 12, "bold")
+            header, text="TCP · Reliable", corner_radius=14, width=150, height=30,
+            font=(F, 12, "bold")
         )
+        self.protocol_badge.pack(side="right", padx=24)
 
-        self.protocol_badge.grid(
-            row=0,
-            column=1,
-            rowspan=2,
-            padx=(16, 0),
-            sticky="w"
-        )
+        ctk.CTkFrame(self, height=1, fg_color=theme.BORDER, corner_radius=0).pack(fill="x")
 
-        # -------------------------------------------------
-        # Server IP
-        # -------------------------------------------------
+        # ---- connection card ----
+        card = ctk.CTkFrame(self, fg_color=theme.BG_PANEL, border_width=1,
+                            border_color=theme.BORDER, corner_radius=theme.CORNER_RADIUS)
+        card.pack(fill="x", padx=24, pady=(16, 0))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=16, pady=14)
 
-        ctk.CTkLabel(
-            inner,
-            text="Server IP",
-            text_color=theme.TEXT_MUTED
-        ).grid(
-            row=2,
-            column=0,
-            sticky="w"
-        )
+        # row 0/1: Protocol | Server IP | Port | Connect
+        self._small_label(inner, "Protocol").grid(row=0, column=0, sticky="w")
+        self._small_label(inner, "Command Center IP").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self._small_label(inner, "Port").grid(row=0, column=2, sticky="w", padx=(12, 0))
 
-        self.ip_entry = ctk.CTkEntry(
-            inner,
-            width=160
-        )
+        self.protocol_switch = self._segmented(inner, ["TCP", "UDP"], self._on_protocol_change)
+        self.protocol_switch.set("TCP")
+        self.protocol_switch.grid(row=1, column=0, sticky="w", pady=(2, 10))
 
-        self.ip_entry.insert(
-            0,
-            "127.0.0.1"
-        )
-
-        self.ip_entry.grid(
-            row=3,
-            column=0,
-            sticky="w",
-            pady=(2, 10)
-        )
-
-        # -------------------------------------------------
-        # Port
-        # -------------------------------------------------
-
-        ctk.CTkLabel(
-            inner,
-            text="Port",
-            text_color=theme.TEXT_MUTED
-        ).grid(
-            row=2,
-            column=1,
-            sticky="w",
-            padx=(16, 0)
-        )
-
-        self.port_entry = ctk.CTkEntry(
-            inner,
-            width=90
-        )
-
-        # TCP now uses port 5050
-        self.port_entry.insert(
-            0,
-            str(TCP_PORT)
-        )
-
-        self.port_entry.grid(
-            row=3,
-            column=1,
-            sticky="w",
-            padx=(16, 0),
-            pady=(2, 10)
-        )
-
-        # -------------------------------------------------
-        # Connect button
-        # -------------------------------------------------
+        self.ip_entry = self._entry(inner, 140, "127.0.0.1")
+        self.ip_entry.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(2, 10))
+        self.port_entry = self._entry(inner, 70, "5050")
+        self.port_entry.grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(2, 10))
 
         self.connect_btn = ctk.CTkButton(
-            inner,
-            text="Connect",
-            command=self.toggle_connection,
-            width=110
+            inner, text="Connect", width=100, fg_color=theme.BUTTON,
+            hover_color=theme.BUTTON_HOVER, command=self.toggle_connection
         )
+        self.connect_btn.grid(row=1, column=3, sticky="e", padx=(12, 0), pady=(2, 10))
+        inner.grid_columnconfigure(3, weight=1)
 
-        self.connect_btn.grid(
-            row=3,
-            column=2,
-            sticky="w",
-            padx=(16, 0)
-        )
+        # row 2/3: Callsign | Packet-loss slider
+        self._small_label(inner, "Callsign").grid(row=2, column=0, sticky="w")
+        self.loss_label = self._small_label(inner, "Simulated packet loss (UDP only): 30%")
+        self.loss_label.grid(row=2, column=1, columnspan=3, sticky="w", padx=(12, 0))
 
-        # -------------------------------------------------
-        # Connection status
-        # -------------------------------------------------
-
-        self.status_dot = ctk.CTkLabel(
-            inner,
-            text="●",
-            text_color=theme.RED_ERR,
-            font=(theme.FONT_FAMILY, 16)
-        )
-
-        self.status_dot.grid(
-            row=4,
-            column=0,
-            sticky="w",
-            pady=(4, 0)
-        )
-
-        self.status_label = ctk.CTkLabel(
-            inner,
-            text="Disconnected",
-            text_color=theme.TEXT_MUTED
-        )
-
-        self.status_label.grid(
-            row=4,
-            column=1,
-            columnspan=2,
-            sticky="w",
-            pady=(4, 0)
-        )
-
-        # -------------------------------------------------
-        # UDP Packet Loss Simulation
-        # -------------------------------------------------
-
-        self.loss_label = ctk.CTkLabel(
-            inner,
-            text="Simulated packet loss (UDP only): 30%",
-            text_color=theme.TEXT_MUTED
-        )
-
-        self.loss_label.grid(
-            row=5,
-            column=0,
-            columnspan=3,
-            sticky="w",
-            pady=(12, 0)
-        )
-
-        self.loss_slider = ctk.CTkSlider(
-            inner,
-            from_=0,
-            to=90,
-            number_of_steps=18,
-            command=self._on_loss_change,
-            width=340
-        )
-
+        self.callsign_entry = self._entry(inner, 100, "ALPHA-1")
+        self.callsign_entry.grid(row=3, column=0, sticky="w", pady=(2, 0))
+        self.loss_slider = ctk.CTkSlider(inner, from_=0, to=90, number_of_steps=18,
+                                         command=self._on_loss_change, width=260)
         self.loss_slider.set(30)
+        self.loss_slider.grid(row=3, column=1, columnspan=3, sticky="w", padx=(12, 0), pady=(2, 0))
 
-        self.loss_slider.grid(
-            row=6,
-            column=0,
-            columnspan=3,
-            sticky="w",
-            pady=(4, 0)
-        )
+        # row 4: connection status
+        status = ctk.CTkFrame(inner, fg_color="transparent")
+        status.grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        self.status_dot = ctk.CTkLabel(status, text="●", text_color=theme.RED_ERR, font=(F, 14))
+        self.status_dot.pack(side="left", padx=(0, 6))
+        self.status_label = ctk.CTkLabel(status, text="Disconnected", font=(F, 12),
+                                         text_color=theme.TEXT_MUTED)
+        self.status_label.pack(side="left")
 
-        # -------------------------------------------------
-        # Statistics
-        # -------------------------------------------------
+        # ---- stats strip ----
+        stats = ctk.CTkFrame(self, fg_color="transparent")
+        stats.pack(fill="x", padx=24, pady=(12, 0))
+        self.sent_card = self._stat_card(stats, "Sent", theme.TEXT_PRIMARY)
+        self.sent_card.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self.recv_card = self._stat_card(stats, "Received", theme.GREEN_OK)
+        self.recv_card.grid(row=0, column=1, padx=6, sticky="ew")
+        self.drop_card = self._stat_card(stats, "Dropped", theme.RED_ERR)
+        self.drop_card.grid(row=0, column=2, padx=(6, 0), sticky="ew")
+        for c in range(3):
+            stats.grid_columnconfigure(c, weight=1)
 
-        stats = ctk.CTkFrame(
-            self,
-            fg_color=theme.BG_MAIN,
-            corner_radius=0
-        )
+        # ---- bottom composer (packed before the chat so it stays visible) ----
+        composer = ctk.CTkFrame(self, fg_color="transparent")
+        composer.pack(side="bottom", fill="x", padx=24, pady=(0, 20))
 
-        stats.pack(
-            side="top",
-            fill="x",
-            padx=16,
-            pady=(10, 0)
-        )
+        prio_row = ctk.CTkFrame(composer, fg_color="transparent")
+        prio_row.pack(fill="x", pady=(0, 8))
+        self._small_label(prio_row, "Priority").pack(side="left", padx=(0, 10))
+        self.priority_switch = self._segmented(prio_row, ["Routine", "Urgent", "Critical"],
+                                               self._on_priority_change)
+        self.priority_switch.set("Routine")
+        self.priority_switch.pack(side="left")
+        self._on_priority_change("Routine")
 
-        self.sent_card = self._stat_card(
-            stats,
-            "Sent",
-            theme.TEXT_PRIMARY
-        )
-
-        self.sent_card.grid(
-            row=0,
-            column=0,
-            padx=(0, 6),
-            sticky="ew"
-        )
-
-        self.recv_card = self._stat_card(
-            stats,
-            "Received",
-            theme.GREEN_OK
-        )
-
-        self.recv_card.grid(
-            row=0,
-            column=1,
-            padx=6,
-            sticky="ew"
-        )
-
-        self.drop_card = self._stat_card(
-            stats,
-            "Dropped",
-            theme.RED_ERR
-        )
-
-        self.drop_card.grid(
-            row=0,
-            column=2,
-            padx=(6, 0),
-            sticky="ew"
-        )
-
-        for column in range(3):
-            stats.grid_columnconfigure(
-                column,
-                weight=1
-            )
-
-        # -------------------------------------------------
-        # Chat area
-        # -------------------------------------------------
-
-        self.chat_frame = ctk.CTkScrollableFrame(
-            self,
-            fg_color=theme.BG_PANEL,
-            corner_radius=12
-        )
-
-        self.chat_frame.pack(
-            side="top",
-            fill="both",
-            expand=True,
-            padx=16,
-            pady=12
-        )
-
-        # -------------------------------------------------
-        # Message input
-        # -------------------------------------------------
-
-        entry_row = ctk.CTkFrame(
-            self,
-            fg_color="transparent"
-        )
-
-        entry_row.pack(
-            side="bottom",
-            fill="x",
-            padx=16,
-            pady=(0, 16)
-        )
-
+        entry_row = ctk.CTkFrame(composer, fg_color="transparent")
+        entry_row.pack(fill="x")
         self.msg_entry = ctk.CTkEntry(
-            entry_row,
-            placeholder_text="Type a message..."
+            entry_row, placeholder_text="Type a field report...", height=38,
+            fg_color=theme.BG_MAIN, border_color=theme.BORDER, border_width=1,
+            text_color=theme.TEXT_PRIMARY
         )
+        self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.msg_entry.bind("<Return>", lambda _e: self.send_message())
+        self.send_btn = ctk.CTkButton(entry_row, text="Send", width=90, height=38,
+                                      fg_color=theme.BUTTON, hover_color=theme.BUTTON_HOVER,
+                                      command=self.send_message)
+        self.send_btn.pack(side="left")
 
-        self.msg_entry.pack(
-            side="left",
-            fill="x",
-            expand=True,
-            padx=(0, 8)
+        # ---- chat bubble area ----
+        self.chat_frame = ctk.CTkScrollableFrame(
+            self, fg_color=theme.BG_MAIN, border_width=1, border_color=theme.BORDER,
+            corner_radius=theme.CORNER_RADIUS
         )
-
-        # Press Enter to send
-
-        self.msg_entry.bind(
-            "<Return>",
-            lambda event: self.send_message()
-        )
-
-        self.send_btn = ctk.CTkButton(
-            entry_row,
-            text="Send",
-            width=90,
-            command=self.send_message
-        )
-
-        self.send_btn.pack(
-            side="left"
-        )
-
-    # =====================================================
-    # STATISTICS CARD
-    # =====================================================
+        self.chat_frame.pack(side="top", fill="both", expand=True, padx=24, pady=12)
 
     def _stat_card(self, parent, label, color):
-
-        card = ctk.CTkFrame(
-            parent,
-            fg_color=theme.BG_CARD,
-            corner_radius=12
-        )
-
-        ctk.CTkLabel(
-            card,
-            text=label,
-            text_color=theme.TEXT_MUTED
-        ).pack(
-            anchor="w",
-            padx=12,
-            pady=(8, 0)
-        )
-
-        value_label = ctk.CTkLabel(
-            card,
-            text="0",
-            text_color=color,
-            font=(theme.FONT_FAMILY, 22, "bold")
-        )
-
-        value_label.pack(
-            anchor="w",
-            padx=12,
-            pady=(0, 8)
-        )
-
+        card = ctk.CTkFrame(parent, fg_color=theme.BG_MAIN, border_width=1,
+                            border_color=theme.BORDER, corner_radius=theme.CORNER_RADIUS)
+        ctk.CTkLabel(card, text=label, font=(F, 11), text_color=theme.TEXT_MUTED
+                     ).pack(anchor="w", padx=14, pady=(8, 0))
+        value_label = ctk.CTkLabel(card, text="0", text_color=color, font=(F, 22, "bold"))
+        value_label.pack(anchor="w", padx=14, pady=(0, 8))
         card.value_label = value_label
-
         return card
 
-    # =====================================================
-    # CHAT BUBBLES
-    # =====================================================
-
-    def _add_bubble(
-        self,
-        text,
-        *,
-        sent,
-        dropped=False,
-        system=False
-    ):
-
-        row = ctk.CTkFrame(
-            self.chat_frame,
-            fg_color="transparent"
-        )
-
-        row.pack(
-            fill="x",
-            pady=4,
-            padx=6
-        )
-
-        # System messages
+    # ------------------------------------------------------------------
+    # Chat bubbles
+    # ------------------------------------------------------------------
+    def _add_bubble(self, text, *, sent, dropped=False, system=False,
+                    header=None, header_color=None, proto=None):
+        row = ctk.CTkFrame(self.chat_frame, fg_color="transparent")
+        row.pack(fill="x", pady=4, padx=6)
 
         if system:
-
-            label = ctk.CTkLabel(
-                row,
-                text=text,
-                text_color=theme.BUBBLE_SYSTEM_TEXT,
-                font=(theme.FONT_FAMILY, 11, "italic")
-            )
-
-            label.pack(anchor="center")
-
+            ctk.CTkLabel(row, text=text, text_color=theme.TEXT_MUTED,
+                         font=(F, 11, "italic")).pack(anchor="center")
             self._scroll_to_bottom()
-
             return
 
-        # Dropped UDP message
-
         if dropped:
-
-            fg = theme.BUBBLE_DROPPED
-            txt_color = theme.BUBBLE_DROPPED_TEXT
-            border = theme.BUBBLE_DROPPED_BORDER
-
-            prefix = "✕ dropped: "
-
-        # Sent message
-
+            fg, border, txt = theme.BUBBLE_DROPPED, theme.BUBBLE_DROPPED_BORDER, theme.BUBBLE_DROPPED_TEXT
         elif sent:
-
-            fg = theme.BUBBLE_SENT
-            txt_color = theme.BUBBLE_SENT_TEXT
-            border = theme.BUBBLE_SENT
-
-            prefix = ""
-
-        # Received message
-
+            fg, border, txt = theme.BUBBLE_SENT, theme.BUBBLE_SENT_BORDER, theme.TEXT_PRIMARY
         else:
+            fg, border, txt = theme.BUBBLE_RECEIVED, theme.BUBBLE_RECEIVED_BORDER, theme.TEXT_PRIMARY
 
-            fg = theme.BUBBLE_RECEIVED
-            txt_color = theme.BUBBLE_RECEIVED_TEXT
-            border = theme.BUBBLE_RECEIVED
+        bubble = ctk.CTkFrame(row, fg_color=fg, corner_radius=theme.CORNER_RADIUS,
+                              border_width=1, border_color=border)
+        bubble.pack(side="right" if sent else "left")
 
-            prefix = ""
+        if header:
+            ctk.CTkLabel(bubble, text=header, font=(F, 10, "bold"),
+                         text_color=header_color or theme.TEXT_MUTED
+                         ).pack(anchor="w", padx=12, pady=(8, 0))
+        ctk.CTkLabel(bubble, text=text, text_color=txt, wraplength=300, justify="left",
+                     font=(F, 13)).pack(anchor="w", padx=12, pady=(2, 0))
+        if dropped:
+            ctk.CTkLabel(bubble, text="✕  Packet lost — not delivered", font=(F, 10, "bold"),
+                         text_color=theme.RED_ERR).pack(anchor="w", padx=12, pady=(2, 0))
 
-        bubble = ctk.CTkFrame(
-            row,
-            fg_color=fg,
-            corner_radius=theme.CORNER_RADIUS,
-            border_width=2 if dropped else 0,
-            border_color=border
-        )
-
-        bubble.pack(
-            side="right" if sent else "left"
-        )
-
-        ctk.CTkLabel(
-            bubble,
-            text=f"{prefix}{text}",
-            text_color=txt_color,
-            wraplength=300,
-            justify="left",
-            font=(theme.FONT_FAMILY, 13)
-        ).pack(
-            padx=12,
-            pady=(8, 2)
-        )
-
-        ctk.CTkLabel(
-            bubble,
-            text=now(),
-            text_color=txt_color,
-            font=(theme.FONT_FAMILY, 9)
-        ).pack(
-            anchor="e" if sent else "w",
-            padx=12,
-            pady=(0, 6)
-        )
+        foot = ctk.CTkFrame(bubble, fg_color="transparent")
+        foot.pack(fill="x", padx=12, pady=(2, 8))
+        ctk.CTkLabel(foot, text=now(), font=(F, 9), text_color=theme.TEXT_MUTED).pack(side="left")
+        if proto:
+            ctk.CTkLabel(foot, text=proto, font=(F, 9, "bold"),
+                         text_color=theme.PROTOCOL_STYLE[proto][0]).pack(side="right", padx=(16, 0))
 
         self._scroll_to_bottom()
 
     def _scroll_to_bottom(self):
-
         self.chat_frame.update_idletasks()
-
         self.chat_frame._parent_canvas.yview_moveto(1.0)
 
-    # =====================================================
-    # PROTOCOL SWITCHING
-    # =====================================================
-
-    def _on_protocol_change(self, value):
-
-        # Disconnect existing socket before switching protocol
-
-        if self.connected:
-            self.disconnect()
-
-        # -------------------------------------------------
-        # TCP selected
-        # -------------------------------------------------
-
-        if value == "TCP":
-
-            self.protocol_badge.configure(
-                text="TCP  (reliable)",
-                fg_color=theme.TCP_COLOR
-            )
-
-            # Automatically change port to 5050
-
-            self.port_entry.delete(
-                0,
-                "end"
-            )
-
-            self.port_entry.insert(
-                0,
-                str(TCP_PORT)
-            )
-
-        # -------------------------------------------------
-        # UDP selected
-        # -------------------------------------------------
-
-        else:
-
-            self.protocol_badge.configure(
-                text="UDP  (unreliable)",
-                fg_color=theme.UDP_COLOR
-            )
-
-            # Automatically change port to 5001
-
-            self.port_entry.delete(
-                0,
-                "end"
-            )
-
-            self.port_entry.insert(
-                0,
-                str(UDP_PORT)
-            )
-
-    # =====================================================
-    # PACKET LOSS SLIDER
-    # =====================================================
-
-    def _on_loss_change(self, value):
-
-        self.loss_label.configure(
-            text=f"Simulated packet loss (UDP only): {int(value)}%"
+    # ------------------------------------------------------------------
+    # Protocol switching / options
+    # ------------------------------------------------------------------
+    def _apply_protocol_style(self, value):
+        """Recolor the badge, switch and slider for the chosen protocol."""
+        color, soft, label = theme.PROTOCOL_STYLE[value]
+        self.protocol_badge.configure(text=f"●  {label}", fg_color=soft, text_color=color)
+        self.protocol_switch.configure(selected_color=color, selected_hover_color=color)
+        # Packet-loss simulation only applies to UDP, so dim it for TCP.
+        self.loss_slider.configure(
+            state="normal" if value == "UDP" else "disabled",
+            progress_color=color, button_color=color, button_hover_color=color,
         )
 
-    # =====================================================
-    # CONNECT / DISCONNECT
-    # =====================================================
+    def _on_protocol_change(self, value):
+        if self.connected:
+            # A live socket belongs to one protocol only -- switching
+            # protocols mid-session means starting a fresh connection.
+            self.disconnect()
+        self._apply_protocol_style(value)
+        if value == "TCP" and self.port_entry.get() == "5001":
+            self.port_entry.delete(0, "end")
+            self.port_entry.insert(0, "5050")
+        elif value == "UDP" and self.port_entry.get() == "5050":
+            self.port_entry.delete(0, "end")
+            self.port_entry.insert(0, "5001")
 
+    def _on_priority_change(self, value):
+        color = theme.PRIORITY_COLORS[value.upper()]
+        self.priority_switch.configure(selected_color=color, selected_hover_color=color)
+
+    def _on_loss_change(self, value):
+        self.loss_label.configure(text=f"Simulated packet loss (UDP only): {int(value)}%")
+
+    # ------------------------------------------------------------------
+    # Connect / disconnect
+    # ------------------------------------------------------------------
     def toggle_connection(self):
-
         if self.connected:
             self.disconnect()
-
         else:
             self.connect()
 
     def connect(self):
-
         host = self.ip_entry.get().strip()
-
         try:
-
-            port = int(
-                self.port_entry.get()
-            )
-
+            port = int(self.port_entry.get())
         except ValueError:
-
-            self._add_bubble(
-                "Port must be a number.",
-                sent=False,
-                system=True
-            )
-
+            self._add_bubble("Port must be a number.", sent=False, system=True)
             return
 
         protocol = self.protocol_switch.get()
-
-        # =================================================
-        # TCP CONNECTION
-        # =================================================
-
         if protocol == "TCP":
-
-            # SOCK_STREAM creates a TCP socket
-
-            self.tcp_socket = socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM
-            )
-
+            self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-
-                # TCP requires a connection with the server
-
-                self.tcp_socket.connect(
-                    (host, port)
-                )
-
-            except OSError as error:
-
-                self._add_bubble(
-                    f"TCP connection failed: {error}",
-                    sent=False,
-                    system=True
-                )
-
+                self.tcp_socket.connect((host, port))
+            except OSError as exc:
+                self._add_bubble(f"TCP connection failed: {exc}", sent=False, system=True)
                 self.tcp_socket = None
-
                 return
-
             self.connected = True
-
-            # Start receiving messages in background
-
-            self.listen_thread = threading.Thread(
-                target=self._tcp_listen,
-                daemon=True
-            )
-
+            self.listen_thread = threading.Thread(target=self._tcp_listen, daemon=True)
             self.listen_thread.start()
-
-            self.status_dot.configure(
-                text_color=theme.GREEN_OK
-            )
-
-            self.status_label.configure(
-                text=f"Connected (TCP) to {host}:{port}"
-            )
-
-            self._add_bubble(
-                f"TCP connection established with {host}:{port}",
-                sent=False,
-                system=True
-            )
-
-        # =================================================
-        # UDP
-        # =================================================
-
+            self.status_dot.configure(text_color=theme.GREEN_OK)
+            self.status_label.configure(text=f"Connected via TCP to {host}:{port}")
+            self._add_bubble(f"TCP connection established with {host}:{port}", sent=False, system=True)
         else:
-
-            # SOCK_DGRAM creates a UDP socket
-
-            self.udp_socket = socket.socket(
-                socket.AF_INET,
-                socket.SOCK_DGRAM
-            )
-
-            # Let operating system select client-side port
-
-            self.udp_socket.bind(
-                ("0.0.0.0", 0)
-            )
-
-            # Store server address
-
-            self.udp_target = (
-                host,
-                port
-            )
-
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.bind(("0.0.0.0", 0))  # let the OS pick a free local port for replies
+            self.udp_target = (host, port)
             self.connected = True
-
-            # Start UDP receiving thread
-
-            self.listen_thread = threading.Thread(
-                target=self._udp_listen,
-                daemon=True
-            )
-
+            self.listen_thread = threading.Thread(target=self._udp_listen, daemon=True)
             self.listen_thread.start()
+            # UDP is connectionless -- "Ready" is the technically accurate
+            # label; there is no handshake with the server.
+            self.status_dot.configure(text_color=theme.YELLOW_WARN)
+            self.status_label.configure(text=f"Ready via UDP → {host}:{port}")
+            self._add_bubble(f"UDP target set to {host}:{port} (no handshake in UDP)", sent=False, system=True)
 
-            # UDP does not actually establish a connection
-
-            self.status_dot.configure(
-                text_color=theme.YELLOW_WARN
-            )
-
-            self.status_label.configure(
-                text=f"Ready (UDP) -> {host}:{port}"
-            )
-
-            self._add_bubble(
-                f"UDP target set to {host}:{port} (no handshake in UDP)",
-                sent=False,
-                system=True
-            )
-
-        self.connect_btn.configure(
-            text="Disconnect"
-        )
-
-        # Prevent protocol switching while connected
-
-        self.protocol_switch.configure(
-            state="disabled"
-        )
-
-    # =====================================================
-    # DISCONNECT
-    # =====================================================
+        self.connect_btn.configure(text="Disconnect", fg_color=theme.RED_ERR, hover_color="#b91c1c")
+        self.protocol_switch.configure(state="disabled")
 
     def disconnect(self):
-
         self.connected = False
-
-        for sock in (
-            self.tcp_socket,
-            self.udp_socket
-        ):
-
+        for sock in (self.tcp_socket, self.udp_socket):
             if sock:
-
                 try:
                     sock.close()
-
                 except OSError:
                     pass
-
         self.tcp_socket = None
         self.udp_socket = None
-
-        self.status_dot.configure(
-            text_color=theme.RED_ERR
-        )
-
-        self.status_label.configure(
-            text="Disconnected"
-        )
-
-        self.connect_btn.configure(
-            text="Connect"
-        )
-
-        self.protocol_switch.configure(
-            state="normal"
-        )
-
-    # =====================================================
-    # WINDOW CLOSE
-    # =====================================================
+        self.status_dot.configure(text_color=theme.RED_ERR)
+        self.status_label.configure(text="Disconnected")
+        self.connect_btn.configure(text="Connect", fg_color=theme.BUTTON, hover_color=theme.BUTTON_HOVER)
+        self.protocol_switch.configure(state="normal")
 
     def _on_close(self):
-
         self.disconnect()
-
         self.destroy()
 
-    # =====================================================
-    # SEND MESSAGE
-    # =====================================================
-
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
     def send_message(self):
-
         text = self.msg_entry.get().strip()
-
         if not text:
             return
-
         if not self.connected:
-
-            self._add_bubble(
-                "Not connected -- click Connect first.",
-                sent=False,
-                system=True
-            )
-
+            self._add_bubble("Not connected — click Connect first.", sent=False, system=True)
             return
 
         protocol = self.protocol_switch.get()
-
-        # =================================================
-        # SEND USING TCP
-        # =================================================
+        priority = self.priority_switch.get().upper()
+        callsign = self.callsign_entry.get().strip() or "UNIT"
+        wire_text = messages.encode_message(callsign, priority, text)
+        bubble_kwargs = dict(
+            sent=True, header=f"{callsign}  ·  {priority}",
+            header_color=theme.PRIORITY_COLORS[priority], proto=protocol,
+        )
 
         if protocol == "TCP":
-
+            # TCP never simulates loss: the point of the demo is that TCP's
+            # guarantees mean nothing is dropped here.
             try:
-
-                self.tcp_socket.sendall(
-                    text.encode("utf-8")
-                )
-
+                self.tcp_socket.sendall(wire_text.encode("utf-8"))
                 self.sent_count += 1
-
-                self._add_bubble(
-                    text,
-                    sent=True
-                )
-
-            except OSError as error:
-
-                self._add_bubble(
-                    f"Send failed: {error}",
-                    sent=False,
-                    system=True
-                )
-
+                self._add_bubble(text, **bubble_kwargs)
+            except OSError as exc:
+                self._add_bubble(f"Send failed, connection lost: {exc}", sent=False, system=True)
                 self.disconnect()
-
-        # =================================================
-        # SEND USING UDP
-        # =================================================
-
         else:
-
-            loss_probability = (
-                self.loss_slider.get() / 100.0
-            )
-
-            # Generate random number between 0 and 1.
-            # If it falls below loss probability,
-            # simulate a dropped UDP packet.
-
+            loss_probability = self.loss_slider.get() / 100.0
             if random.random() < loss_probability:
-
+                # Simulated loss: sendto() is deliberately never called, so
+                # the server genuinely never receives this packet -- exactly
+                # like a real dropped UDP datagram.
                 self.dropped_count += 1
-
-                self._add_bubble(
-                    text,
-                    sent=True,
-                    dropped=True
-                )
-
+                self._add_bubble(text, dropped=True, **bubble_kwargs)
             else:
-
                 try:
-
-                    self.udp_socket.sendto(
-                        text.encode("utf-8"),
-                        self.udp_target
-                    )
-
+                    self.udp_socket.sendto(wire_text.encode("utf-8"), self.udp_target)
                     self.sent_count += 1
-
-                    self._add_bubble(
-                        text,
-                        sent=True
-                    )
-
-                except OSError as error:
-
-                    self._add_bubble(
-                        f"UDP send error: {error}",
-                        sent=False,
-                        system=True
-                    )
+                    self._add_bubble(text, **bubble_kwargs)
+                except OSError as exc:
+                    self._add_bubble(f"UDP send error: {exc}", sent=False, system=True)
 
         self._refresh_stats()
-
-        self.msg_entry.delete(
-            0,
-            "end"
-        )
-
-    # =====================================================
-    # UPDATE STATISTICS
-    # =====================================================
+        self.msg_entry.delete(0, "end")
 
     def _refresh_stats(self):
+        self.sent_card.value_label.configure(text=str(self.sent_count))
+        self.recv_card.value_label.configure(text=str(self.received_count))
+        self.drop_card.value_label.configure(text=str(self.dropped_count))
 
-        self.sent_card.value_label.configure(
-            text=str(self.sent_count)
-        )
-
-        self.recv_card.value_label.configure(
-            text=str(self.received_count)
-        )
-
-        self.drop_card.value_label.configure(
-            text=str(self.dropped_count)
-        )
-
-    # =====================================================
-    # TCP RECEIVE THREAD
-    # =====================================================
-
+    # ------------------------------------------------------------------
+    # Receiving (background threads -> queue -> GUI thread)
+    # ------------------------------------------------------------------
     def _tcp_listen(self):
-
         sock = self.tcp_socket
-
         while self.connected and sock:
-
             try:
-
-                data = sock.recv(
-                    BUFFER_SIZE
-                )
-
+                data = sock.recv(BUFFER_SIZE)
             except OSError:
                 break
-
             if not data:
-
-                self.event_queue.put(
-                    (
-                        "system",
-                        "Server closed the TCP connection."
-                    )
-                )
-
+                self.event_queue.put(("system", "Command Center closed the TCP connection."))
                 break
-
-            self.event_queue.put(
-                (
-                    "recv",
-                    data.decode(
-                        "utf-8",
-                        errors="replace"
-                    )
-                )
-            )
-
-    # =====================================================
-    # UDP RECEIVE THREAD
-    # =====================================================
+            self.event_queue.put(("recv", data.decode("utf-8", errors="replace")))
 
     def _udp_listen(self):
-
         sock = self.udp_socket
-
         while self.connected and sock:
-
             try:
-
-                data, address = sock.recvfrom(
-                    BUFFER_SIZE
-                )
-
+                data, _addr = sock.recvfrom(BUFFER_SIZE)
             except OSError:
                 break
-
-            self.event_queue.put(
-                (
-                    "recv",
-                    data.decode(
-                        "utf-8",
-                        errors="replace"
-                    )
-                )
-            )
-
-    # =====================================================
-    # PROCESS RECEIVED MESSAGES
-    # =====================================================
+            self.event_queue.put(("recv", data.decode("utf-8", errors="replace")))
 
     def _drain_queue(self):
-
         while not self.event_queue.empty():
-
             kind, payload = self.event_queue.get()
-
             if kind == "recv":
-
                 self.received_count += 1
-
-                self._add_bubble(
-                    payload,
-                    sent=False
-                )
-
+                # The server echoes each report back as "ACK:<report>".
+                body = payload[4:] if payload.startswith("ACK:") else payload
+                _call, _prio, text = messages.decode_message(body)
+                self._add_bubble(f"✓  Received: {text}", sent=False,
+                                 header="COMMAND CENTER  ·  ACK",
+                                 header_color=theme.GREEN_OK,
+                                 proto=self.protocol_switch.get())
                 self._refresh_stats()
-
             elif kind == "system":
+                self._add_bubble(payload, sent=False, system=True)
+        self.after(100, self._drain_queue)
 
-                self._add_bubble(
-                    payload,
-                    sent=False,
-                    system=True
-                )
-
-        # Check queue again after 100 ms
-
-        self.after(
-            100,
-            self._drain_queue
-        )
-
-
-# =========================================================
-# START APPLICATION
-# =========================================================
 
 if __name__ == "__main__":
-
-    app = ChatClient()
-
+    app = FieldUnit()
     app.mainloop()

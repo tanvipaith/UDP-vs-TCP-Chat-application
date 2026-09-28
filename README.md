@@ -1,52 +1,32 @@
-# TCP / UDP Chat Application
+# Disaster Response Communication System
 
-A desktop chat app (Python + Tkinter/CustomTkinter) that lets you switch
-between raw **TCP** and **UDP** sockets and see the reliability difference
-between them live, including a simulated packet-loss demo for UDP.
+A desktop app where rescue **Field Units** send reports to a **Command Center**
+over raw **TCP** or **UDP** sockets, with live acknowledgements, statistics and
+a UDP packet-loss simulator that shows the reliability difference between the two.
 
 ## Files
-- `server.py` — runs a TCP server and a UDP server at the same time (two ports, two threads)
-- `client.py` — GUI client with a TCP/UDP switch, IP/port fields, chat bubbles, and a packet-loss slider
-- `theme.py` — shared colors/fonts used by both windows
-- `requirements.txt` — the one third-party dependency
+- `server.py` : Command Center. Runs a TCP server and a UDP server at once (two ports, two threads) and shows incoming reports as cards.
+- `client.py` : Field Unit. TCP/UDP switch, IP/port, callsign, priority, chat bubbles, packet-loss slider, Sent/Received/Dropped stats.
+- `messages.py` : the small wire format shared by both (`CALLSIGN|PRIORITY|text`).
+- `theme.py` : colors and fonts (white, minimal theme) for both windows.
+- `requirements.txt` : one dependency (`customtkinter`).
 
 ## Setup
 ```bash
 python3 -m venv venv
-source venv/bin/activate        # On Windows: venv\Scripts\activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
-Tkinter itself ships with standard Python on Windows/macOS. On Linux, if you
-get an error about `_tkinter`, install it once with:
-```bash
-sudo apt-get install python3-tk
-```
+On Linux, if you get an error about `_tkinter`: `sudo apt-get install python3-tk`
 
-## Running the demo
-1. **Start the server first:**
-   ```bash
-   python3 server.py
-   ```
-   Leave the host as `0.0.0.0`, ports as `5050` (TCP) / `5001` (UDP), and click **Start Server**.
+## Run
+1. `python3 server.py` then click **Start Server** (TCP 5000, UDP 5001).
+2. `python3 client.py`, keep IP `127.0.0.1`, pick **TCP** or **UDP**, click **Connect**.
+3. Choose a priority, type a report, press **Send**.
 
-2. **Start the client:**
-   ```bash
-   python3 client.py
-   ```
-   Set Server IP to `127.0.0.1` (if running on the same machine), pick **TCP** or **UDP**,
-   click **Connect**, and start sending messages.
-
-3. **Demonstrate the difference:**
-   - In **TCP** mode, send 10–20 messages quickly — every single one arrives at the
-     server and every ACK comes back to the client. Sent == Received, Dropped stays 0.
-   - Switch to **UDP** mode, set the "Simulated packet loss" slider (e.g. 30%), and
-     send the same messages — you'll see some bubbles marked **✕ dropped** in red,
-     and the Dropped counter climbing, because those packets were never actually
-     transmitted (simulating real-world UDP loss).
-   - You can run a second `client.py` instance to chat from two clients into the
-     same server at once.
-
-## Ports
-- TCP default: `5050`
-- UDP default: `5001`
-(The client auto-fills whichever default matches the protocol you select, but you can change them.)
+## Demo
+- **TCP:** send 10 reports. Sent equals Received, Dropped stays 0.
+- **UDP:** set the packet-loss slider to about 40% and send 10 reports. Some bubbles
+  show "Packet lost — not delivered", the Dropped counter rises, and the Command
+  Center only shows the reports that actually got through.
+- Run a second `client.py` with a different callsign to simulate two rescue teams.
